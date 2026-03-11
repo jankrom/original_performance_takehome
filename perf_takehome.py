@@ -298,7 +298,6 @@ class KernelBuilder:
         cond = self.alloc_scratch("cond", VLEN)
 
         for i in range(0, batch_size, VLEN):
-            body.append(("load", ("vload", idx_base + i, self.scratch_const(inp_indices_p + i))))
             body.append(("load", ("vload", val_base + i, self.scratch_const(inp_values_p + i))))
 
         for _ in range(rounds):
@@ -309,20 +308,17 @@ class KernelBuilder:
                 body.append(("valu", ("^", val_base + i, val_base + i, node_vals)))
                 body.extend(self.build_vhash(val_base + i, tmp1, tmp2, vec_hash_consts))
                 body.append(("valu", ("&", cond, val_base + i, one_v)))
-                body.append(("valu", ("==", cond, cond, zero_v)))
-                body.append(("valu", ("<<", tmp1, idx_base + i, one_v)))
-                body.append(("valu", ("+", tmp1, tmp1, two_v)))
-                body.append(("valu", ("-", idx_base + i, tmp1, cond)))
+                body.append(("valu", ("multiply_add", idx_base + i, idx_base + i, two_v, one_v)))
+                body.append(("valu", ("+", idx_base + i, idx_base + i, cond)))
                 body.append(("valu", ("<", cond, idx_base + i, n_nodes_v)))
-                body.append(("flow", ("vselect", idx_base + i, cond, idx_base + i, zero_v)))
+                body.append(("valu", ("*", idx_base + i, idx_base + i, cond)))
 
         for i in range(0, batch_size, VLEN):
             body.append(("store", ("vstore", self.scratch_const(inp_values_p + i), val_base + i)))
 
         body_instrs = self.build(body)
+        body_instrs[-1]["flow"] = [("pause",)]
         self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
 
