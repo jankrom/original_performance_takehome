@@ -48,11 +48,140 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
+    def _scratch_range(self, start, length):
+        return set(range(start, start + length))
+
+    def _slot_meta(self, engine, slot):
+        reads = set()
+        writes = set()
+        mem_read = False
+        mem_write = False
+        barrier = False
+
+        match (engine, slot):
+            case ("alu", (_, dest, a1, a2)):
+                writes.add(dest)
+                reads.update((a1, a2))
+            case ("valu", ("vbroadcast", dest, src)):
+                writes.update(self._scratch_range(dest, VLEN))
+                reads.add(src)
+            case ("valu", ("multiply_add", dest, a, b, c)):
+                writes.update(self._scratch_range(dest, VLEN))
+                reads.update(self._scratch_range(a, VLEN))
+                reads.update(self._scratch_range(b, VLEN))
+                reads.update(self._scratch_range(c, VLEN))
+            case ("valu", (_, dest, a1, a2)):
+                writes.update(self._scratch_range(dest, VLEN))
+                reads.update(self._scratch_range(a1, VLEN))
+                reads.update(self._scratch_range(a2, VLEN))
+            case ("load", ("load", dest, addr)):
+                writes.add(dest)
+                reads.add(addr)
+                mem_read = True
+            case ("load", ("load_offset", dest, addr, offset)):
+                writes.add(dest + offset)
+                reads.add(addr + offset)
+                mem_read = True
+            case ("load", ("vload", dest, addr)):
+                writes.update(self._scratch_range(dest, VLEN))
+                reads.add(addr)
+                mem_read = True
+            case ("load", ("const", dest, _)):
+                writes.add(dest)
+            case ("store", ("store", addr, src)):
+                reads.update((addr, src))
+                mem_write = True
+            case ("store", ("vstore", addr, src)):
+                reads.add(addr)
+                reads.update(self._scratch_range(src, VLEN))
+                mem_write = True
+            case ("flow", ("select", dest, cond, a, b)):
+                writes.add(dest)
+                reads.update((cond, a, b))
+            case ("flow", ("add_imm", dest, a, _)):
+                writes.add(dest)
+                reads.add(a)
+            case ("flow", ("vselect", dest, cond, a, b)):
+                writes.update(self._scratch_range(dest, VLEN))
+                reads.update(self._scratch_range(cond, VLEN))
+                reads.update(self._scratch_range(a, VLEN))
+                reads.update(self._scratch_range(b, VLEN))
+            case ("flow", ("coreid", dest)):
+                writes.add(dest)
+            case ("flow", ("trace_write", val)):
+                reads.add(val)
+            case ("flow", ("cond_jump", cond, _)):
+                reads.add(cond)
+                barrier = True
+            case ("flow", ("cond_jump_rel", cond, _)):
+                reads.add(cond)
+                barrier = True
+            case ("flow", ("jump_indirect", addr)):
+                reads.add(addr)
+                barrier = True
+            case ("flow", ("pause",) | ("halt",) | ("jump", _)):
+                barrier = True
+            case ("debug", ("compare", loc, _)):
+                reads.add(loc)
+            case ("debug", ("vcompare", loc, _)):
+                reads.update(self._scratch_range(loc, VLEN))
+            case ("debug", _):
+                pass
+            case _:
+                raise NotImplementedError(f"Unknown slot for scheduling: {engine} {slot}")
+
+        return {
+            "reads": reads,
+            "writes": writes,
+            "mem_read": mem_read,
+            "mem_write": mem_write,
+            "barrier": barrier,
+        }
+
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
+        bundle = {}
+        bundle_reads = set()
+        bundle_writes = set()
+        bundle_has_mem_write = False
+
+        def flush():
+            nonlocal bundle, bundle_reads, bundle_writes, bundle_has_mem_write
+            if bundle:
+                instrs.append(bundle)
+                bundle = {}
+                bundle_reads = set()
+                bundle_writes = set()
+                bundle_has_mem_write = False
+
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            meta = self._slot_meta(engine, slot)
+            engine_slots = bundle.get(engine, [])
+            exceeds_slots = len(engine_slots) >= SLOT_LIMITS[engine]
+            depends_on_pending_write = bool(meta["reads"] & bundle_writes)
+            overwrites_pending_write = bool(meta["writes"] & bundle_writes)
+            conflicts_with_store = bundle_has_mem_write and (meta["mem_read"] or meta["mem_write"])
+            is_barrier = meta["barrier"]
+
+            if (
+                exceeds_slots
+                or depends_on_pending_write
+                or overwrites_pending_write
+                or conflicts_with_store
+                or is_barrier
+            ):
+                flush()
+
+            if is_barrier:
+                instrs.append({engine: [slot]})
+                continue
+
+            bundle.setdefault(engine, []).append(slot)
+            bundle_reads.update(meta["reads"])
+            bundle_writes.update(meta["writes"])
+            bundle_has_mem_write = bundle_has_mem_write or meta["mem_write"]
+
+        flush()
         return instrs
 
     def add(self, engine, slot):
