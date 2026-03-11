@@ -40,6 +40,7 @@ from problem import (
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
+        self.init_slots = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
@@ -200,7 +201,7 @@ class KernelBuilder:
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            self.init_slots.append(("load", ("const", addr, val)))
             self.const_map[val] = addr
         return self.const_map[val]
 
@@ -208,7 +209,7 @@ class KernelBuilder:
         if val not in self.vec_const_map:
             scalar_addr = self.scratch_const(val, name)
             vec_addr = self.alloc_scratch(f"{name}_vec" if name is not None else None, VLEN)
-            self.add("valu", ("vbroadcast", vec_addr, scalar_addr))
+            self.init_slots.append(("valu", ("vbroadcast", vec_addr, scalar_addr)))
             self.vec_const_map[val] = vec_addr
         return self.vec_const_map[val]
 
@@ -241,6 +242,150 @@ class KernelBuilder:
 
         return slots
 
+    def build_block_bundles(
+        self,
+        idx_addr,
+        val_addr,
+        gather_addr,
+        node_addr,
+        tmp1,
+        tmp2,
+        forest_values_p_v,
+        one_v,
+        two_v,
+        n_nodes_v,
+        vec_hash_consts,
+        store_addr=None,
+        update_index=True,
+    ):
+        bundles = [
+            {"valu": [("+", gather_addr, idx_addr, forest_values_p_v)]},
+            {
+                "load": [
+                    ("load_offset", node_addr, gather_addr, 0),
+                    ("load_offset", node_addr, gather_addr, 1),
+                ]
+            },
+            {
+                "load": [
+                    ("load_offset", node_addr, gather_addr, 2),
+                    ("load_offset", node_addr, gather_addr, 3),
+                ]
+            },
+            {
+                "load": [
+                    ("load_offset", node_addr, gather_addr, 4),
+                    ("load_offset", node_addr, gather_addr, 5),
+                ]
+            },
+            {
+                "load": [
+                    ("load_offset", node_addr, gather_addr, 6),
+                    ("load_offset", node_addr, gather_addr, 7),
+                ]
+            },
+            {"valu": [("^", val_addr, val_addr, node_addr)]},
+        ]
+
+        for stage in vec_hash_consts:
+            if stage[0] == "multiply_add":
+                _, multiplier_vec, add_vec = stage
+                bundles.append(
+                    {
+                        "valu": [
+                            ("multiply_add", val_addr, val_addr, multiplier_vec, add_vec)
+                        ]
+                    }
+                )
+                continue
+
+            _, op1, op2, op3, val1_vec, val3_vec = stage
+            bundles.append(
+                {
+                    "valu": [
+                        (op1, tmp1, val_addr, val1_vec),
+                        (op3, tmp2, val_addr, val3_vec),
+                    ]
+                }
+            )
+            bundles.append({"valu": [(op2, val_addr, tmp1, tmp2)]})
+
+        if update_index:
+            bundles.extend(
+                [
+                    {
+                        "valu": [
+                            ("&", node_addr, val_addr, one_v),
+                            ("multiply_add", idx_addr, idx_addr, two_v, one_v),
+                        ]
+                    },
+                    {"valu": [("+", idx_addr, idx_addr, node_addr)]},
+                    {"valu": [("<", node_addr, idx_addr, n_nodes_v)]},
+                    {"valu": [("*", idx_addr, idx_addr, node_addr)]},
+                ]
+            )
+        if store_addr is not None:
+            bundles.append({"store": [("vstore", store_addr, val_addr)]})
+        return bundles
+
+    def _bundle_fits(self, bundle, candidate):
+        for engine, slots in candidate.items():
+            if len(bundle.get(engine, [])) + len(slots) > SLOT_LIMITS[engine]:
+                return False
+        return True
+
+    def _merge_bundle(self, bundle, candidate):
+        for engine, slots in candidate.items():
+            bundle.setdefault(engine, []).extend(slots)
+
+    def schedule_bundle_groups(self, bundle_groups):
+        instrs = []
+        positions = [0] * len(bundle_groups)
+        start = 0
+
+        while any(pos < len(group) for pos, group in zip(positions, bundle_groups)):
+            instr = {}
+
+            load_candidates = []
+            valu_candidates = []
+            other_candidates = []
+
+            for offset in range(len(bundle_groups)):
+                group_i = (start + offset) % len(bundle_groups)
+                if positions[group_i] >= len(bundle_groups[group_i]):
+                    continue
+
+                candidate = bundle_groups[group_i][positions[group_i]]
+                if "load" in candidate:
+                    load_candidates.append(group_i)
+                elif "valu" in candidate:
+                    valu_candidates.append(group_i)
+                else:
+                    other_candidates.append(group_i)
+
+            if load_candidates:
+                group_i = min(load_candidates, key=lambda i: positions[i])
+                candidate = bundle_groups[group_i][positions[group_i]]
+                self._merge_bundle(instr, candidate)
+                positions[group_i] += 1
+
+            for group_i in sorted(valu_candidates, key=lambda i: positions[i], reverse=True):
+                candidate = bundle_groups[group_i][positions[group_i]]
+                if self._bundle_fits(instr, candidate):
+                    self._merge_bundle(instr, candidate)
+                    positions[group_i] += 1
+
+            for group_i in other_candidates:
+                candidate = bundle_groups[group_i][positions[group_i]]
+                if self._bundle_fits(instr, candidate):
+                    self._merge_bundle(instr, candidate)
+                    positions[group_i] += 1
+
+            instrs.append(instr)
+            start = (start + 1) % len(bundle_groups)
+
+        return instrs
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -250,7 +395,6 @@ class KernelBuilder:
         """
         assert batch_size % VLEN == 0, "This kernel expects a full vector tail"
 
-        zero_v = self.scratch_vec_const(0, "zero")
         one_v = self.scratch_vec_const(1, "one")
         two_v = self.scratch_vec_const(2, "two")
         forest_values_p_v = self.scratch_vec_const(7, "forest_values_p")
@@ -281,44 +425,55 @@ class KernelBuilder:
                     )
                 )
 
+        prologue = []  # array of slots
+
+        idx_base = self.alloc_scratch("idx", batch_size)
+        val_base = self.alloc_scratch("val", batch_size)
+        wave_size = batch_size // VLEN
+        gather_bank = self.alloc_scratch("gather_bank", wave_size * VLEN)
+        node_bank = self.alloc_scratch("node_bank", wave_size * VLEN)
+        tmp1_bank = self.alloc_scratch("tmp1_bank", wave_size * VLEN)
+
+        for i in range(0, batch_size, VLEN):
+            prologue.append(("load", ("vload", val_base + i, self.scratch_const(inp_values_p + i))))
+
+        bundle_groups = []
+        for block_i, i in enumerate(range(0, batch_size, VLEN)):
+            buf = block_i * VLEN
+            block_bundles = []
+            for round_i in range(rounds):
+                store_addr = None
+                if round_i == rounds - 1:
+                    store_addr = self.scratch_const(inp_values_p + i)
+                block_bundles.extend(
+                    self.build_block_bundles(
+                        idx_base + i,
+                        val_base + i,
+                        gather_bank + buf,
+                        node_bank + buf,
+                        tmp1_bank + buf,
+                        gather_bank + buf,
+                        forest_values_p_v,
+                        one_v,
+                        two_v,
+                        n_nodes_v,
+                        vec_hash_consts,
+                        store_addr,
+                        round_i != rounds - 1,
+                    )
+                )
+            bundle_groups.append(block_bundles)
+
+        self.instrs.extend(self.build(self.init_slots))
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
         # submission harness ignores them.
         self.add("flow", ("pause",))
+        self.instrs.extend(self.build(prologue))
+        self.instrs.extend(self.schedule_bundle_groups(bundle_groups))
 
-        body = []  # array of slots
-
-        idx_base = self.alloc_scratch("idx", batch_size)
-        val_base = self.alloc_scratch("val", batch_size)
-        gather_addrs = self.alloc_scratch("gather_addrs", VLEN)
-        node_vals = self.alloc_scratch("node_vals", VLEN)
-        tmp1 = self.alloc_scratch("tmp1", VLEN)
-        tmp2 = self.alloc_scratch("tmp2", VLEN)
-        cond = self.alloc_scratch("cond", VLEN)
-
-        for i in range(0, batch_size, VLEN):
-            body.append(("load", ("vload", val_base + i, self.scratch_const(inp_values_p + i))))
-
-        for _ in range(rounds):
-            for i in range(0, batch_size, VLEN):
-                body.append(("valu", ("+", gather_addrs, idx_base + i, forest_values_p_v)))
-                for lane in range(VLEN):
-                    body.append(("load", ("load_offset", node_vals, gather_addrs, lane)))
-                body.append(("valu", ("^", val_base + i, val_base + i, node_vals)))
-                body.extend(self.build_vhash(val_base + i, tmp1, tmp2, vec_hash_consts))
-                body.append(("valu", ("&", cond, val_base + i, one_v)))
-                body.append(("valu", ("multiply_add", idx_base + i, idx_base + i, two_v, one_v)))
-                body.append(("valu", ("+", idx_base + i, idx_base + i, cond)))
-                body.append(("valu", ("<", cond, idx_base + i, n_nodes_v)))
-                body.append(("valu", ("*", idx_base + i, idx_base + i, cond)))
-
-        for i in range(0, batch_size, VLEN):
-            body.append(("store", ("vstore", self.scratch_const(inp_values_p + i), val_base + i)))
-
-        body_instrs = self.build(body)
-        body_instrs[-1]["flow"] = [("pause",)]
-        self.instrs.extend(body_instrs)
+        self.instrs[-1]["flow"] = [("pause",)]
 
 BASELINE = 147734
 
