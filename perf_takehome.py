@@ -226,7 +226,15 @@ class KernelBuilder:
     def build_vhash(self, val_hash_addr, tmp1, tmp2, vec_hash_consts):
         slots = []
 
-        for op1, op2, op3, val1_vec, val3_vec in vec_hash_consts:
+        for stage in vec_hash_consts:
+            if stage[0] == "multiply_add":
+                _, multiplier_vec, add_vec = stage
+                slots.append(
+                    ("valu", ("multiply_add", val_hash_addr, val_hash_addr, multiplier_vec, add_vec))
+                )
+                continue
+
+            _, op1, op2, op3, val1_vec, val3_vec = stage
             slots.append(("valu", (op1, tmp1, val_hash_addr, val1_vec)))
             slots.append(("valu", (op3, tmp2, val_hash_addr, val3_vec)))
             slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
@@ -253,15 +261,25 @@ class KernelBuilder:
 
         vec_hash_consts = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            vec_hash_consts.append(
-                (
-                    op1,
-                    op2,
-                    op3,
-                    self.scratch_vec_const(val1, f"hash_{hi}_lhs"),
-                    self.scratch_vec_const(val3, f"hash_{hi}_rhs"),
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                vec_hash_consts.append(
+                    (
+                        "multiply_add",
+                        self.scratch_vec_const((1 << val3) + 1, f"hash_{hi}_mul"),
+                        self.scratch_vec_const(val1, f"hash_{hi}_add"),
+                    )
                 )
-            )
+            else:
+                vec_hash_consts.append(
+                    (
+                        "generic",
+                        op1,
+                        op2,
+                        op3,
+                        self.scratch_vec_const(val1, f"hash_{hi}_lhs"),
+                        self.scratch_vec_const(val3, f"hash_{hi}_rhs"),
+                    )
+                )
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
